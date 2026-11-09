@@ -1,19 +1,22 @@
 -- ============================================================================
 -- BDII · Práctica 1 · Temática: IES (Instituto de Educación Secundaria)
 -- Oracle 26ai · Script completo: DROP, tablas y restricciones, datos de prueba,
--- vistas, comprobaciones y validación del estado final. Re-ejecutable.
+-- vistas, comprobaciones y auditoría de reglas. Re-ejecutable.
 -- Convención de nombres: PK_<tabla>, FK_<tabla>_<destino>, UQ_<tabla>_<col>,
 --                        CK_<tabla>_<col>, V_<vista>, P_<procedimiento>
 --
--- ESTRATEGIA PARA LAS REGLAS QUE EL MODELO ANTERIOR DEJABA PENDIENTES
---   (todo declarativo, sin triggers):
+-- ESTRATEGIA DE IMPLANTACIÓN DE LAS REGLAS (todo declarativo, sin triggers)
 --   * Claves foráneas COMPUESTAS para exigir combinaciones válidas
 --     (destinatario autorizado, evaluación con matrícula, grupo-curso).
---   * Mínimos (1,N) y totalidad: una FK DEFERRABLE INITIALLY DEFERRED desde
---     el lado "obligatorio" hacia una fila concreta del lado "muchos"
---     (columnas *_REF, NOT NULL). Se comprueba al COMMIT, así que las altas
---     se hacen en una sola transacción.
---   * Disyunción de Empleado: columna TIPO + FK (NSS, TIPO) desde la subclase.
+--   * Mínimos (1,N) y totalidad en los casos con solución declarativa: una FK
+--     DEFERRABLE INITIALLY DEFERRED desde el lado "obligatorio" hacia una fila
+--     concreta del lado "muchos" (columnas *_REF / NSS_JEFE, NOT NULL). Se
+--     comprueba al COMMIT, así que esas altas se hacen en una sola transacción.
+--   * Disyunción de EMPLEADO: columna TIPO + FK (NSS, TIPO) desde la subclase.
+--   * Mínimos (1,N) restantes (S-01, RN-09, S-02, S-04, RN-17, RN-18): no tienen
+--     forma declarativa razonable; se vigilan con la vista V_AUDITORIA_REGLAS
+--     (sección 5), que debe devolver 0 violaciones, y se prueban con
+--     P_PRUEBA_AUDITORIA (se provoca la violación y se comprueba que se detecta).
 -- ============================================================================
 
 SET SERVEROUTPUT ON;
@@ -23,8 +26,11 @@ SET DEFINE OFF;
 -- ============================================================================
 -- 0. DROP (IF EXISTS permite ejecutar el script sobre un esquema limpio)
 -- ============================================================================
+DROP VIEW IF EXISTS V_AUDITORIA_REGLAS;
+DROP VIEW IF EXISTS V_PROFESOR_ANTIGUEDAD;
 DROP VIEW IF EXISTS V_NOTAS_ALUMNO;
 DROP VIEW IF EXISTS V_AULA_LABORATORIO;
+DROP PROCEDURE IF EXISTS P_PRUEBA_AUDITORIA;
 DROP PROCEDURE IF EXISTS P_PRUEBA;
 DROP PROCEDURE IF EXISTS P_ALTA_PROFESOR;
 DROP PROCEDURE IF EXISTS P_ALTA_ALUMNO;
@@ -54,9 +60,25 @@ DROP TABLE IF EXISTS EMPLEADO CASCADE CONSTRAINTS PURGE;
 
 -- ============================================================================
 -- 1. TABLAS Y RESTRICCIONES
---    Acciones referenciales: CASCADE solo en entidades débiles, atributos
---    multivaluados y tablas puente sin vida propia; el resto, restrictivo
---    (por defecto) para no perder histórico académico (notas, matrículas).
+--
+-- ACCIONES REFERENCIALES. Por defecto RESTRICTIVAS (sin cláusula) para no perder
+-- histórico académico (matrículas, notas, docencia). Excepciones razonadas:
+--   ON DELETE CASCADE
+--     FK_PROFESOR_EMPLEADO, FK_PAS_EMPLEADO ....... la subclase es la misma entidad
+--     FK_JEFE_PROFESOR, FK_TUTOR_GRUPO_PROFESOR ... un rol de profesor no existe sin el profesor
+--     FK_SUSTITUYE_SUSTITUTO / _SUSTITUIDO ........ una sustitución no existe sin sus profesores
+--     FK_PERIODO_SUSTITUYE ........................ atributo multivaluado de SUSTITUYE
+--     FK_TELEFONO_ALUMNO .......................... atributo multivaluado de ALUMNO
+--     FK_TUTELA_TUTOR / FK_TUTELA_ALUMNO .......... tabla puente sin vida propia
+--     FK_DESTINATARIO_ALUMNO / _TUTOR ............. la categoría solo existe con la persona
+--     FK_INCIDENCIA_ALUMNO ........................ entidad débil: depende de su propietario
+--     FK_AULA_EDIFICIO ............................ entidad débil: depende de su propietario
+--     FK_OCUPA_AULA ............................... tabla puente sin vida propia
+--   ON DELETE SET NULL
+--     FK_PAS_SUPERVISOR ........................... el supervisado sigue existiendo (mín 0)
+--   RESTRICTIVAS relevantes: FK_INCIDENCIA_TUTELA (no se borra una tutela ya usada
+--   en una notificación), FK_MATRICULA_*, FK_EVALUA_*, FK_IMPARTE_*, FK_OCUPA_GRUPO,
+--   FK_PROFESOR_DEPARTAMENTO, FK_JEFE_DEPARTAMENTO.
 -- ============================================================================
 
 -- ---- EMPLEADO (superclase de la especialización DISJUNTA y TOTAL) ----------
@@ -137,7 +159,13 @@ CREATE TABLE GRUPO (
     CURSO_ACADEMICO   VARCHAR2(9)   NOT NULL,   -- formato 2025/2026
     CONSTRAINT PK_GRUPO PRIMARY KEY (ID_GRUPO),
     CONSTRAINT UQ_GRUPO_ID_CURSO UNIQUE (ID_GRUPO, CURSO_ACADEMICO),
-    CONSTRAINT CK_GRUPO_CURSO CHECK (REGEXP_LIKE(CURSO_ACADEMICO, '^[0-9]{4}/[0-9]{4}$'))
+    CONSTRAINT CK_GRUPO_CURSO CHECK (REGEXP_LIKE(CURSO_ACADEMICO, '^[0-9]{4}/[0-9]{4}$')),
+    -- el segundo año es el siguiente al primero (CASE evita errores de conversión
+    -- si el formato fuera incorrecto; de eso ya se ocupa CK_GRUPO_CURSO)
+    CONSTRAINT CK_GRUPO_CURSO_CONSEC CHECK (
+        CASE WHEN REGEXP_LIKE(CURSO_ACADEMICO, '^[0-9]{4}/[0-9]{4}$')
+             THEN TO_NUMBER(SUBSTR(CURSO_ACADEMICO, 6, 4)) - TO_NUMBER(SUBSTR(CURSO_ACADEMICO, 1, 4))
+        END = 1)
 );
 
 -- ---- JEFE_DEPARTAMENTO (subclase solapada de PROFESOR; DIRIGE 1:1) ---------
@@ -214,7 +242,7 @@ CREATE TABLE TUTOR_LEGAL (
 );
 
 -- ---- ALUMNO (DIRECCION = atributo compuesto) -------------------------------
--- TELEFONO_REF y DNI_TUTOR_REF: mínimos RN01 (>= 1 teléfono) y (>= 1 tutela),
+-- TELEFONO_REF y DNI_TUTOR_REF: mínimos RN-01 (>= 1 teléfono) y (>= 1 tutela),
 -- con FK diferidas (se crean tras TELEFONO_ALUMNO y TUTELA).
 CREATE TABLE ALUMNO (
     DNI               VARCHAR2(10),
@@ -283,7 +311,7 @@ CREATE TABLE DESTINATARIO (
 );
 
 -- ---- INCIDENCIA (entidad débil de ALUMNO) con NOTIFICA (1:N) fusionada -----
--- RN04: el destinatario es el propio alumno protagonista (DNI_ALUMNO_DEST) o
+-- RN-04: el destinatario es el propio alumno protagonista (DNI_ALUMNO_DEST) o
 -- un tutor que lo tutela (DNI_TUTOR_DEST). Exactamente una de las dos columnas.
 --   FK_INCIDENCIA_DEST_ALUMNO / _DEST_TUTOR: el destinatario corresponde a esa persona.
 --   CK_INCIDENCIA_DEST: si es el alumno, ha de ser el protagonista.
@@ -464,7 +492,7 @@ INSERT INTO ALUMNO (DNI,NOMBRE,APELLIDOS,FECHA_NACIMIENTO,CALLE,NUMERO,CODIGO_PO
 
 INSERT INTO TELEFONO_ALUMNO VALUES ('A0000001A','611000001');
 INSERT INTO TELEFONO_ALUMNO VALUES ('A0000001A','611000002');
-INSERT INTO TELEFONO_ALUMNO VALUES ('A0000002B','633000002');   -- dato que faltaba (RN01)
+INSERT INTO TELEFONO_ALUMNO VALUES ('A0000002B','633000002');   -- dato que faltaba (RN-01)
 INSERT INTO TELEFONO_ALUMNO VALUES ('A0000003C','622000003');
 
 INSERT INTO TUTELA VALUES ('T0000001A','A0000001A');
@@ -550,6 +578,18 @@ SELECT COD_EDIFICIO, NUM_AULA, CAPACIDAD, TIPO
 FROM AULA
 WHERE TIPO = 'LABORATORIO'
 WITH CHECK OPTION CONSTRAINT CK_V_AULA_LABORATORIO;
+
+-- 3.3 Vista del atributo DERIVADO antigüedad (RN-06): no se almacena, se calcula
+--     a partir de FECHA_INGRESO (años completos). Una sola tabla base y clave
+--     completa: NSS, FECHA_INGRESO y COD_DEPARTAMENTO son actualizables;
+--     ANTIGUEDAD_ANIOS es una expresión y NO es actualizable (ORA-01733).
+CREATE OR REPLACE VIEW V_PROFESOR_ANTIGUEDAD
+    (NSS, FECHA_INGRESO, COD_DEPARTAMENTO, ANTIGUEDAD_ANIOS) AS
+SELECT NSS,
+       FECHA_INGRESO,
+       COD_DEPARTAMENTO,
+       TRUNC(MONTHS_BETWEEN(SYSDATE, FECHA_INGRESO) / 12)
+FROM PROFESOR;
 
 -- ============================================================================
 -- 4. COMPROBACIONES
@@ -757,8 +797,16 @@ BEGIN
     P_PRUEBA('CHECK código postal con 5 dígitos (formato incorrecto)',
         q'[UPDATE ALUMNO SET CODIGO_POSTAL = '3200' WHERE DNI = 'A0000001A']',
         1, -2290, 'CK_ALUMNO_CP');
+    P_PRUEBA('CHECK curso académico consecutivo: 2026/2027 válido',
+        q'[INSERT INTO GRUPO VALUES ('GX2','2026/2027')]', 0);
+    P_PRUEBA('CHECK curso académico no consecutivo: 2025/2027',
+        q'[INSERT INTO GRUPO VALUES ('GX1','2025/2027')]',
+        1, -2290, 'CK_GRUPO_CURSO_CONSEC');
+    P_PRUEBA('CHECK formato de curso académico incorrecto: 25/26',
+        q'[INSERT INTO GRUPO VALUES ('GX3','25/26')]',
+        1, -2290, 'CK_GRUPO_CURSO');
 
-    DBMS_OUTPUT.PUT_LINE('--- RN04: DESTINATARIO AUTORIZADO Y ORIGEN DE LA CATEGORIA ---');
+    DBMS_OUTPUT.PUT_LINE('--- RN-04: DESTINATARIO AUTORIZADO Y ORIGEN DE LA CATEGORIA ---');
     P_PRUEBA('Incidencia válida: A0000002B notificada a su tutor T0000001A',
         q'[INSERT INTO INCIDENCIA (DNI_ALUMNO,NUM_INCIDENCIA,FECHA,DESCRIPCION,GRAVEDAD,FECHA_NOTIFICACION,ID_DESTINATARIO,DNI_ALUMNO_DEST,DNI_TUTOR_DEST)
            VALUES ('A0000002B',2,DATE '2025-12-01','x','LEVE',DATE '2025-12-02',
@@ -836,10 +884,10 @@ BEGIN
     P_PRUEBA('Profesor que es a la vez tutor de grupo y jefe de departamento (permitido: solapada)',
         q'[INSERT INTO TUTOR_GRUPO VALUES ('111111111111','G0A')]', 0);
 
-    DBMS_OUTPUT.PUT_LINE('--- MINIMOS OBLIGATORIOS (RN01, tutela, jefe, periodo) ---');
+    DBMS_OUTPUT.PUT_LINE('--- MINIMOS OBLIGATORIOS (RN-01, tutela, jefe, periodo) ---');
     P_PRUEBA('Alta de alumno completa (teléfono y tutela)',
         q'[BEGIN P_ALTA_ALUMNO('A0000009Z',1,1); END;]', 0);
-    P_PRUEBA('Alta de alumno sin teléfono (RN01)',
+    P_PRUEBA('Alta de alumno sin teléfono (RN-01)',
         q'[BEGIN P_ALTA_ALUMNO('A0000009Z',0,1); END;]',
         1, -2291, 'FK_ALUMNO_TELEFONO_REF');
     P_PRUEBA('Alta de alumno sin ninguna tutela',
@@ -868,8 +916,41 @@ BEGIN
 END;
 /
 
+-- Efecto real de las acciones referenciales (no solo que se acepten)
+DECLARE
+    V_SUP    VARCHAR2(20) := 'SIN_COMPROBAR';
+    V_AULAS  NUMBER;
+    V_OCUPA  NUMBER;
+BEGIN
+    -- ON DELETE SET NULL: al borrar al supervisor, el supervisado queda sin supervisor
+    DELETE FROM EMPLEADO WHERE NSS = '444444444444';
+    SELECT NSS_SUPERVISOR INTO V_SUP FROM PAS WHERE NSS = '555555555555';
+    IF V_SUP IS NULL THEN
+        DBMS_OUTPUT.PUT_LINE('[OK]    SET NULL: el PAS supervisado queda sin supervisor');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('[ERROR] SET NULL: el supervisado conserva supervisor ' || V_SUP);
+    END IF;
+    ROLLBACK;
+
+    -- ON DELETE CASCADE: al borrar el edificio desaparecen sus aulas y ocupaciones
+    DELETE FROM EDIFICIO WHERE COD_EDIFICIO = 'E2';
+    SELECT COUNT(*) INTO V_AULAS FROM AULA   WHERE COD_EDIFICIO = 'E2';
+    SELECT COUNT(*) INTO V_OCUPA FROM OCUPA  WHERE COD_EDIFICIO = 'E2';
+    IF V_AULAS = 0 AND V_OCUPA = 0 THEN
+        DBMS_OUTPUT.PUT_LINE('[OK]    CASCADE: borrar el edificio E2 elimina sus aulas y ocupaciones');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('[ERROR] CASCADE: quedan aulas=' || V_AULAS || ' ocupaciones=' || V_OCUPA);
+    END IF;
+    ROLLBACK;
+EXCEPTION WHEN OTHERS THEN
+    ROLLBACK;
+    DBMS_OUTPUT.PUT_LINE('[ERROR] Verificación de acciones referenciales: ' || SUBSTR(SQLERRM,1,120));
+END;
+/
+
 -- Vista no actualizable: consulta y DML rechazado
-PROMPT --- V_NOTAS_ALUMNO ---
+BEGIN DBMS_OUTPUT.PUT_LINE('--- V_NOTAS_ALUMNO ---'); END;
+/
 SELECT * FROM V_NOTAS_ALUMNO ORDER BY DNI_ALUMNO;
 
 BEGIN
@@ -899,11 +980,15 @@ BEGIN
         DBMS_OUTPUT.PUT_LINE('[ERROR] V_NOTAS_ALUMNO: asignaturas=' || V_ASIG || ' evaluaciones=' || V_EVAL);
     END IF;
     ROLLBACK;
+EXCEPTION WHEN OTHERS THEN
+    ROLLBACK;
+    DBMS_OUTPUT.PUT_LINE('[ERROR] V_NOTAS_ALUMNO: ' || SUBSTR(SQLERRM,1,120));
 END;
 /
 
 -- Vista actualizable: operación + ROLLBACK
-PROMPT --- V_AULA_LABORATORIO: UPDATE a través de la vista y ROLLBACK ---
+BEGIN DBMS_OUTPUT.PUT_LINE('--- V_AULA_LABORATORIO: UPDATE a través de la vista y ROLLBACK ---'); END;
+/
 UPDATE V_AULA_LABORATORIO SET CAPACIDAD = 24 WHERE COD_EDIFICIO = 'E1' AND NUM_AULA = 'LAB1';
 SELECT COD_EDIFICIO, NUM_AULA, CAPACIDAD, TIPO FROM AULA WHERE NUM_AULA = 'LAB1';
 ROLLBACK;
@@ -921,39 +1006,83 @@ BEGIN
 END;
 /
 
--- ============================================================================
--- 5. VALIDACIÓN DEL ESTADO FINAL
---    Cada regla se vigila con la restricción indicada y se audita con una
---    consulta independiente. Todas deben devolver 0 violaciones.
---
---    Regla                              Control declarativo
---    ---------------------------------  ----------------------------------------
---    RN01 alumno con >= 1 teléfono      ALUMNO.TELEFONO_REF + FK_ALUMNO_TELEFONO_REF (diferida)
---    Alumno con >= 1 tutela             ALUMNO.DNI_TUTOR_REF + FK_ALUMNO_TUTELA_REF (diferida)
---    RN04 destinatario autorizado       FK_INCIDENCIA_DEST_*, FK_INCIDENCIA_TUTELA, CK_INCIDENCIA_DEST
---    Origen único de DESTINATARIO       CK_DESTINATARIO_ORIGEN + UQ_DESTINATARIO_ALUMNO/TUTOR
---    Evaluar solo con matrícula         FK_EVALUA_MATRICULA
---    Un grupo por alumno y curso        UQ_MATRICULA_ALUMNO_CURSO + FK_MATRICULA_GRUPO (grupo, curso)
---    Empleado disjunto                  CK_EMPLEADO_SUBCLASE + FK_PROFESOR/PAS_EMPLEADO (NSS, TIPO)
---    Empleado total                     FK_EMPLEADO_PROFESOR / FK_EMPLEADO_PAS (diferidas)
---    Dpto. con exactamente un jefe      UQ_JEFE_DEPARTAMENTO_DEPT + FK_DEPARTAMENTO_JEFE (diferida)
---    Sustitución con >= 1 periodo       SUSTITUYE.FECHA_PERIODO_REF + FK_SUSTITUYE_PERIODO_REF (diferida)
--- ============================================================================
-PROMPT --- Alumnos sin teléfono (debe salir vacío) ---
-SELECT A.DNI, A.NOMBRE, A.APELLIDOS
-FROM ALUMNO A
-WHERE NOT EXISTS (SELECT 1 FROM TELEFONO_ALUMNO T WHERE T.DNI = A.DNI);
+-- Vista del atributo derivado (RN-06) y actualizabilidad de cada columna
+BEGIN DBMS_OUTPUT.PUT_LINE('--- V_PROFESOR_ANTIGUEDAD ---'); END;
+/
+SELECT NSS, FECHA_INGRESO, ANTIGUEDAD_ANIOS FROM V_PROFESOR_ANTIGUEDAD ORDER BY NSS;
 
-PROMPT --- Auditoría de reglas (VIOLACIONES debe ser 0 en todas) ---
-SELECT 'RN01: alumnos sin teléfono' AS REGLA, COUNT(*) AS VIOLACIONES
+DECLARE
+    V_REAL      NUMBER;
+    V_ESPERADO  NUMBER;
+BEGIN
+    SELECT ANTIGUEDAD_ANIOS INTO V_REAL FROM V_PROFESOR_ANTIGUEDAD WHERE NSS = '222222222222';
+    -- Cálculo independiente: ingresó el 01/09/2001
+    V_ESPERADO := EXTRACT(YEAR FROM SYSDATE) - 2001
+                  - CASE WHEN TO_CHAR(SYSDATE, 'MMDD') < '0901' THEN 1 ELSE 0 END;
+    IF V_REAL = V_ESPERADO THEN
+        DBMS_OUTPUT.PUT_LINE('[OK]    V_PROFESOR_ANTIGUEDAD: antigüedad calculada = ' || V_REAL || ' años');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('[ERROR] V_PROFESOR_ANTIGUEDAD: obtenida=' || V_REAL || ' esperada=' || V_ESPERADO);
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    DBMS_OUTPUT.PUT_LINE('[ERROR] V_PROFESOR_ANTIGUEDAD: ' || SUBSTR(SQLERRM,1,120));
+END;
+/
+
+BEGIN
+    P_PRUEBA('Vista V_PROFESOR_ANTIGUEDAD: UPDATE de una columna base (COD_DEPARTAMENTO)',
+        q'[UPDATE V_PROFESOR_ANTIGUEDAD SET COD_DEPARTAMENTO = 'MAT' WHERE NSS = '111111111111']', 0);
+    P_PRUEBA('Vista V_PROFESOR_ANTIGUEDAD: la antigüedad (derivada) no se puede escribir',
+        q'[UPDATE V_PROFESOR_ANTIGUEDAD SET ANTIGUEDAD_ANIOS = 99 WHERE NSS = '222222222222']',
+        1, -1733);
+END;
+/
+
+-- Actualizabilidad por columna según el diccionario de datos de Oracle
+BEGIN DBMS_OUTPUT.PUT_LINE('--- Actualizabilidad de las vistas (USER_UPDATABLE_COLUMNS) ---'); END;
+/
+SELECT TABLE_NAME, COLUMN_NAME, UPDATABLE, INSERTABLE, DELETABLE
+FROM USER_UPDATABLE_COLUMNS
+WHERE TABLE_NAME IN ('V_NOTAS_ALUMNO','V_AULA_LABORATORIO','V_PROFESOR_ANTIGUEDAD')
+ORDER BY TABLE_NAME, COLUMN_NAME;
+
+-- ============================================================================
+-- 5. AUDITORÍA DE REGLAS SOBRE EL ESTADO FINAL
+--    V_AUDITORIA_REGLAS cuenta violaciones de cada regla; todas deben ser 0.
+--
+--    Regla                                  Control
+--    -------------------------------------  -----------------------------------
+--    RN-01 alumno con >= 1 teléfono         declarativo: ALUMNO.TELEFONO_REF + FK_ALUMNO_TELEFONO_REF (diferida)
+--    RN-02 alumno con >= 1 tutela           declarativo: ALUMNO.DNI_TUTOR_REF + FK_ALUMNO_TUTELA_REF (diferida)
+--    RN-04 destinatario autorizado          declarativo: FK_INCIDENCIA_DEST_*, FK_INCIDENCIA_TUTELA, CK_INCIDENCIA_DEST
+--    RN-04 origen único de DESTINATARIO     declarativo: CK_DESTINATARIO_ORIGEN + UQ_DESTINATARIO_ALUMNO/TUTOR
+--    S-06  evaluar solo con matrícula       declarativo: FK_EVALUA_MATRICULA
+--    RN-13 un grupo por alumno y curso      declarativo: UQ_MATRICULA_ALUMNO_CURSO + FK_MATRICULA_GRUPO (grupo, curso)
+--    RN-05 empleado disjunto y total        declarativo: CK_EMPLEADO_SUBCLASE + FK_PROFESOR/PAS_EMPLEADO + FK_EMPLEADO_PROFESOR/PAS
+--    RN-08 departamento con un jefe         declarativo: UQ_JEFE_DEPARTAMENTO_DEPT + FK_DEPARTAMENTO_JEFE (diferida)
+--    RN-11 sustitución con >= 1 periodo     declarativo: SUSTITUYE.FECHA_PERIODO_REF + FK_SUSTITUYE_PERIODO_REF (diferida)
+--    S-01  tutor con >= 1 alumno            NO declarativo: solo auditoría
+--    RN-09 departamento con >= 1 profesor   NO declarativo: solo auditoría
+--    S-02  destinatario con >= 1 notific.   NO declarativo: solo auditoría
+--    S-04  alumno con >= 1 matrícula        NO declarativo: solo auditoría
+--    S-04  grupo con >= 1 alumno            NO declarativo: solo auditoría
+--    RN-17 edificio con >= 1 aula           NO declarativo: solo auditoría
+--    RN-18 grupo con >= 1 aula              NO declarativo: solo auditoría
+-- ============================================================================
+CREATE OR REPLACE VIEW V_AUDITORIA_REGLAS (REGLA, VIOLACIONES) AS
+SELECT CAST('RN-01: alumnos sin teléfono' AS VARCHAR2(80)), COUNT(*)
 FROM ALUMNO A
 WHERE NOT EXISTS (SELECT 1 FROM TELEFONO_ALUMNO T WHERE T.DNI = A.DNI)
 UNION ALL
-SELECT 'Alumnos sin ninguna tutela', COUNT(*)
+SELECT 'RN-02: alumnos sin ninguna tutela', COUNT(*)
 FROM ALUMNO A
 WHERE NOT EXISTS (SELECT 1 FROM TUTELA T WHERE T.DNI_ALUMNO = A.DNI)
 UNION ALL
-SELECT 'RN04: incidencias con destinatario no autorizado', COUNT(*)
+SELECT 'S-01: tutores legales sin ningún alumno', COUNT(*)
+FROM TUTOR_LEGAL T
+WHERE NOT EXISTS (SELECT 1 FROM TUTELA X WHERE X.DNI_TUTOR = T.DNI_TUTOR)
+UNION ALL
+SELECT 'RN-04: incidencias con destinatario no autorizado', COUNT(*)
 FROM INCIDENCIA I
 WHERE NOT EXISTS (
     SELECT 1 FROM DESTINATARIO D
@@ -961,36 +1090,125 @@ WHERE NOT EXISTS (
       AND (D.DNI_ALUMNO = I.DNI_ALUMNO
            OR D.DNI_TUTOR IN (SELECT T.DNI_TUTOR FROM TUTELA T WHERE T.DNI_ALUMNO = I.DNI_ALUMNO)))
 UNION ALL
-SELECT 'Destinatarios sin exactamente un origen', COUNT(*)
+SELECT 'RN-04: destinatarios sin exactamente un origen', COUNT(*)
 FROM DESTINATARIO
 WHERE (DNI_ALUMNO IS NULL AND DNI_TUTOR IS NULL)
    OR (DNI_ALUMNO IS NOT NULL AND DNI_TUTOR IS NOT NULL)
 UNION ALL
-SELECT 'Evaluaciones sin matrícula en el grupo', COUNT(*)
+SELECT 'S-02: destinatarios sin ninguna notificación', COUNT(*)
+FROM DESTINATARIO D
+WHERE NOT EXISTS (SELECT 1 FROM INCIDENCIA I WHERE I.ID_DESTINATARIO = D.ID_DESTINATARIO)
+UNION ALL
+SELECT 'S-06: evaluaciones sin matrícula en el grupo', COUNT(*)
 FROM EVALUA E
 WHERE NOT EXISTS (SELECT 1 FROM MATRICULA M
                   WHERE M.DNI_ALUMNO = E.DNI_ALUMNO AND M.ID_GRUPO = E.ID_GRUPO)
 UNION ALL
-SELECT 'Alumnos con más de un grupo en el mismo curso', COUNT(*)
+SELECT 'RN-13: alumnos con más de un grupo en el mismo curso', COUNT(*)
 FROM (SELECT DNI_ALUMNO, CURSO_ACADEMICO FROM MATRICULA
       GROUP BY DNI_ALUMNO, CURSO_ACADEMICO HAVING COUNT(*) > 1)
 UNION ALL
-SELECT 'Matrículas con curso distinto al del grupo', COUNT(*)
+SELECT 'RN-13: matrículas con curso distinto al del grupo', COUNT(*)
 FROM MATRICULA M JOIN GRUPO G ON G.ID_GRUPO = M.ID_GRUPO
 WHERE G.CURSO_ACADEMICO <> M.CURSO_ACADEMICO
 UNION ALL
-SELECT 'Empleados sin subclase o en ambas', COUNT(*)
+SELECT 'S-04: alumnos sin ninguna matrícula', COUNT(*)
+FROM ALUMNO A
+WHERE NOT EXISTS (SELECT 1 FROM MATRICULA M WHERE M.DNI_ALUMNO = A.DNI)
+UNION ALL
+SELECT 'S-04: grupos sin ningún alumno', COUNT(*)
+FROM GRUPO G
+WHERE NOT EXISTS (SELECT 1 FROM MATRICULA M WHERE M.ID_GRUPO = G.ID_GRUPO)
+UNION ALL
+SELECT 'RN-05: empleados sin subclase o en ambas', COUNT(*)
 FROM EMPLEADO E
 WHERE (NOT EXISTS (SELECT 1 FROM PROFESOR P WHERE P.NSS = E.NSS)
        AND NOT EXISTS (SELECT 1 FROM PAS S WHERE S.NSS = E.NSS))
    OR (EXISTS (SELECT 1 FROM PROFESOR P WHERE P.NSS = E.NSS)
        AND EXISTS (SELECT 1 FROM PAS S WHERE S.NSS = E.NSS))
 UNION ALL
-SELECT 'Departamentos sin jefe', COUNT(*)
+SELECT 'RN-08: departamentos sin jefe', COUNT(*)
 FROM DEPARTAMENTO D
 WHERE NOT EXISTS (SELECT 1 FROM JEFE_DEPARTAMENTO J WHERE J.COD_DEPARTAMENTO = D.COD_DEPARTAMENTO)
 UNION ALL
-SELECT 'Sustituciones sin periodo', COUNT(*)
+SELECT 'RN-09: departamentos sin ningún profesor', COUNT(*)
+FROM DEPARTAMENTO D
+WHERE NOT EXISTS (SELECT 1 FROM PROFESOR P WHERE P.COD_DEPARTAMENTO = D.COD_DEPARTAMENTO)
+UNION ALL
+SELECT 'RN-11: sustituciones sin periodo', COUNT(*)
 FROM SUSTITUYE S
 WHERE NOT EXISTS (SELECT 1 FROM PERIODO_SUSTITUCION P
-                  WHERE P.NSS_SUSTITUTO = S.NSS_SUSTITUTO AND P.NSS_SUSTITUIDO = S.NSS_SUSTITUIDO);
+                  WHERE P.NSS_SUSTITUTO = S.NSS_SUSTITUTO AND P.NSS_SUSTITUIDO = S.NSS_SUSTITUIDO)
+UNION ALL
+SELECT 'RN-17: edificios sin ningún aula', COUNT(*)
+FROM EDIFICIO E
+WHERE NOT EXISTS (SELECT 1 FROM AULA A WHERE A.COD_EDIFICIO = E.COD_EDIFICIO)
+UNION ALL
+SELECT 'RN-18: grupos sin ningún aula', COUNT(*)
+FROM GRUPO G
+WHERE NOT EXISTS (SELECT 1 FROM OCUPA O WHERE O.ID_GRUPO = G.ID_GRUPO);
+
+-- P_PRUEBA_AUDITORIA: provoca una violación de una regla NO declarativa y comprueba
+-- que V_AUDITORIA_REGLAS la detecta (>= 1 violación). Siempre termina en ROLLBACK.
+CREATE OR REPLACE PROCEDURE P_PRUEBA_AUDITORIA(P_DESC VARCHAR2, P_DML VARCHAR2, P_REGLA VARCHAR2) IS
+    V_N NUMBER;
+BEGIN
+    EXECUTE IMMEDIATE P_DML;
+    SELECT VIOLACIONES INTO V_N FROM V_AUDITORIA_REGLAS WHERE RTRIM(REGLA) = P_REGLA;
+    ROLLBACK;
+    IF V_N >= 1 THEN
+        DBMS_OUTPUT.PUT_LINE('[OK]    Detectada por la auditoría (' || V_N || '): ' || P_DESC);
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('[ERROR] La auditoría no detecta la violación: ' || P_DESC);
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    ROLLBACK;
+    DBMS_OUTPUT.PUT_LINE('[ERROR] Prueba de auditoría fallida: ' || P_DESC || '  -> ' || SUBSTR(SQLERRM,1,100));
+END;
+/
+
+BEGIN DBMS_OUTPUT.PUT_LINE('--- Reglas no declarativas: la violación se acepta pero la auditoría la detecta ---'); END;
+/
+BEGIN
+    P_PRUEBA_AUDITORIA('S-01: tutor legal sin ningún alumno',
+        q'[INSERT INTO TUTOR_LEGAL (DNI_TUTOR,NOMBRE,APELLIDOS,TELEFONO) VALUES ('T0000009Z','Sin','Alumno','600000009')]',
+        'S-01: tutores legales sin ningún alumno');
+    P_PRUEBA_AUDITORIA('RN-09: departamento sin ningún profesor',
+        q'[INSERT INTO DEPARTAMENTO (COD_DEPARTAMENTO,NOMBRE,NSS_JEFE) VALUES ('VAC','Sin profesores','111111111111')]',
+        'RN-09: departamentos sin ningún profesor');
+    P_PRUEBA_AUDITORIA('S-02: destinatario que nunca ha recibido una notificación',
+        q'[BEGIN
+             INSERT INTO TUTOR_LEGAL (DNI_TUTOR,NOMBRE,APELLIDOS,TELEFONO) VALUES ('T0000009Z','Sin','Notificacion','600000009');
+             INSERT INTO DESTINATARIO (DNI_TUTOR) VALUES ('T0000009Z');
+           END;]',
+        'S-02: destinatarios sin ninguna notificación');
+    P_PRUEBA_AUDITORIA('S-04: alumno sin ninguna matrícula',
+        q'[BEGIN P_ALTA_ALUMNO('A0000009Z',1,1); END;]',
+        'S-04: alumnos sin ninguna matrícula');
+    P_PRUEBA_AUDITORIA('S-04: grupo sin ningún alumno',
+        q'[INSERT INTO GRUPO VALUES ('GVAC','2026/2027')]',
+        'S-04: grupos sin ningún alumno');
+    P_PRUEBA_AUDITORIA('RN-17: edificio sin ningún aula',
+        q'[INSERT INTO EDIFICIO VALUES ('E9','Edificio vacío')]',
+        'RN-17: edificios sin ningún aula');
+    P_PRUEBA_AUDITORIA('RN-18: grupo sin ningún aula',
+        q'[INSERT INTO GRUPO VALUES ('GVAC','2026/2027')]',
+        'RN-18: grupos sin ningún aula');
+END;
+/
+
+BEGIN DBMS_OUTPUT.PUT_LINE('--- Auditoría de reglas sobre el estado final (VIOLACIONES debe ser 0 en todas) ---'); END;
+/
+SELECT REGLA, VIOLACIONES FROM V_AUDITORIA_REGLAS;
+
+DECLARE
+    V_N NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO V_N FROM V_AUDITORIA_REGLAS WHERE VIOLACIONES > 0;
+    IF V_N = 0 THEN
+        DBMS_OUTPUT.PUT_LINE('[OK]    Auditoría final: ninguna regla tiene violaciones');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('[ERROR] Auditoría final: ' || V_N || ' regla(s) con violaciones');
+    END IF;
+END;
+/
